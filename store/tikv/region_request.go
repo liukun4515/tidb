@@ -97,6 +97,7 @@ func (s *RegionRequestSender) SendReq(bo *Backoffer, req *tikvrpc.Request, regio
 		}
 
 		s.storeAddr = ctx.Addr
+		// 发送请求到对应的region上
 		resp, retry, err := s.sendReqToRegion(bo, ctx, req, timeout)
 		if err != nil {
 			return nil, errors.Trace(err)
@@ -110,10 +111,14 @@ func (s *RegionRequestSender) SendReq(bo *Backoffer, req *tikvrpc.Request, regio
 			return nil, errors.Trace(err)
 		}
 		if regionErr != nil {
+			// 如果response返回了region上的error错误
+			// 需要处理这个error，看是否可以retry
+			// 如果可以retry就进行重试操作
 			retry, err := s.onRegionError(bo, ctx, regionErr)
 			if err != nil {
 				return nil, errors.Trace(err)
 			}
+			// 如果需要retry，就重新发送请求即可
 			if retry {
 				continue
 			}
@@ -200,7 +205,7 @@ func (s *RegionRequestSender) onRegionError(bo *Backoffer, ctx *RPCContext, regi
 		if err = bo.Backoff(boType, errors.Errorf("not leader: %v, ctx: %v", notLeader, ctx)); err != nil {
 			return false, errors.Trace(err)
 		}
-
+		// leader问题
 		return true, nil
 	}
 
@@ -208,6 +213,7 @@ func (s *RegionRequestSender) onRegionError(bo *Backoffer, ctx *RPCContext, regi
 		// store not match
 		log.Warnf("tikv reports `StoreNotMatch`: %s, ctx: %v, retry later", storeNotMatch, ctx)
 		s.regionCache.ClearStoreByID(ctx.GetStoreID())
+		// store 路径不对
 		return true, nil
 	}
 
@@ -230,6 +236,8 @@ func (s *RegionRequestSender) onRegionError(bo *Backoffer, ctx *RPCContext, regi
 	}
 	if regionErr.GetRaftEntryTooLarge() != nil {
 		log.Warnf("tikv reports `RaftEntryTooLarge`, ctx: %v", ctx)
+		// 如果raft entry 太大了就不能try
+		// 所以如果raft entry的大小太大，就不能进行retry，就需要进行其他方法的处理
 		return false, errors.New(regionErr.String())
 	}
 	// For other errors, we only drop cache here.

@@ -30,7 +30,7 @@ import (
 	"github.com/pingcap/tidb/tablecodec"
 	"github.com/pingcap/tidb/terror"
 	"github.com/pingcap/tidb/util/goroutine_pool"
-	binlog "github.com/pingcap/tipb/go-binlog"
+	"github.com/pingcap/tipb/go-binlog"
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/net/context"
 )
@@ -71,7 +71,7 @@ type twoPhaseCommitter struct {
 	mutations map[string]*pb.Mutation
 	lockTTL   uint64
 	commitTS  uint64
-	mu        struct {
+	mu struct {
 		sync.RWMutex
 		committed       bool
 		undeterminedErr error // undeterminedErr saves the rpc error we encounter when commit primary key.
@@ -160,6 +160,7 @@ func newTwoPhaseCommitter(txn *tikvTxn, connID uint64) (*twoPhaseCommitter, erro
 }
 
 func (c *twoPhaseCommitter) primary() []byte {
+	// 主key
 	return c.keys[0]
 }
 
@@ -192,10 +193,13 @@ func txnLockTTL(startTime time.Time, txnSize int) uint64 {
 // doActionOnKeys groups keys into primary batch and secondary batches, if primary batch exists in the key,
 // it does action on primary batch first, then on secondary batches. If action is commit, secondary batches
 // is done in background goroutine.
+
+// 把需要执行action操作的key进行分组
 func (c *twoPhaseCommitter) doActionOnKeys(bo *Backoffer, action twoPhaseCommitAction, keys [][]byte) error {
 	if len(keys) == 0 {
 		return nil
 	}
+	// 对key进行一个分组
 	groups, firstRegion, err := c.store.regionCache.GroupKeysByRegion(bo, keys)
 	if err != nil {
 		return errors.Trace(err)
@@ -208,23 +212,34 @@ func (c *twoPhaseCommitter) doActionOnKeys(bo *Backoffer, action twoPhaseCommitA
 	if action == actionPrewrite {
 		sizeFunc = c.keyValueSize
 	}
+
+	// batch 数据分组的过程
 	// Make sure the group that contains primary key goes first.
+	// 对其进行一个分组操作
 	batches = appendBatchBySize(batches, firstRegion, groups[firstRegion], sizeFunc, txnCommitBatchSize)
+	// 把是primary的key先进行分组
 	delete(groups, firstRegion)
 	for id, g := range groups {
 		batches = appendBatchBySize(batches, id, g, sizeFunc, txnCommitBatchSize)
 	}
+	// batch 数据分组的过程
 
+	// 因为有递归调用，所以有时候first key并不是primary key，这里做一个判断
 	firstIsPrimary := bytes.Equal(keys[0], c.primary())
+
+	// 如果是primary key，并且操作的类型是commit或者cleanup，需要首先对primary key进行操作。
 	if firstIsPrimary && (action == actionCommit || action == actionCleanup) {
 		// primary should be committed/cleanup first
 		err = c.doActionOnBatches(bo, action, batches[:1])
 		if err != nil {
 			return errors.Trace(err)
 		}
+		// 然后再去处理下边的commit 操作
 		batches = batches[1:]
 	}
+	//
 	if action == actionCommit {
+		// 如果是commit操作，那么之前已经commit了primary key了，所以可以直接后台进行batch action
 		// Commit secondary batches in background goroutine to reduce latency.
 		twoPhaseCommitGP.Go(func() {
 			e := c.doActionOnBatches(bo, action, batches)
@@ -240,6 +255,7 @@ func (c *twoPhaseCommitter) doActionOnKeys(bo *Backoffer, action twoPhaseCommitA
 }
 
 // doActionOnBatches does action to batches in parallel.
+// 并行的做任务的提交工作
 func (c *twoPhaseCommitter) doActionOnBatches(bo *Backoffer, action twoPhaseCommitAction, batches []batchKeys) error {
 	if len(batches) == 0 {
 		return nil
@@ -253,6 +269,8 @@ func (c *twoPhaseCommitter) doActionOnBatches(bo *Backoffer, action twoPhaseComm
 	case actionCleanup:
 		singleBatchActionFunc = c.cleanupSingleBatch
 	}
+	// 如果batch的大小只有一个，那么就串行的提交一个即可
+	// 大小为1的batch就进行串行的提交
 	if len(batches) == 1 {
 		e := singleBatchActionFunc(bo, batches[0])
 		if e != nil {
@@ -260,6 +278,7 @@ func (c *twoPhaseCommitter) doActionOnBatches(bo *Backoffer, action twoPhaseComm
 		}
 		return errors.Trace(e)
 	}
+	// 大小为1的batch就进行串行的提交
 
 	// For prewrite, stop sending other requests after receiving first error.
 	backoffer := bo
@@ -269,6 +288,8 @@ func (c *twoPhaseCommitter) doActionOnBatches(bo *Backoffer, action twoPhaseComm
 	}
 
 	// Concurrently do the work for each batch.
+	// 并发的来处理多行数据的prewrite、cleanup、commit等操作
+	// 大小大于等于2的batch就进行并发的提交，只是backoffer操作不一样而已
 	ch := make(chan error, len(batches))
 	for _, batch1 := range batches {
 
@@ -282,6 +303,8 @@ func (c *twoPhaseCommitter) doActionOnBatches(bo *Backoffer, action twoPhaseComm
 				// Here we makes a new clone of the original backoffer for this goroutine
 				// exclusively to avoid the data race when using the same backoffer
 				// in concurrent goroutines.
+
+				// commit和其他操作对应的backoffer进行分开操作
 				singleBatchBackoffer := backoffer.Clone()
 				ch <- singleBatchActionFunc(singleBatchBackoffer, batch)
 			} else {
@@ -291,8 +314,10 @@ func (c *twoPhaseCommitter) doActionOnBatches(bo *Backoffer, action twoPhaseComm
 			}
 		})
 	}
+	// 错误的处理
 	var err error
 	for i := 0; i < len(batches); i++ {
+		// 如果有一个操作返回了错误信息，那么就全部cancel掉
 		if e := <-ch; e != nil {
 			log.Debugf("con:%d 2PC doActionOnBatches %s failed: %v, tid: %d", c.connID, action, e, c.startTS)
 			// Cancel other requests and return the first error.
@@ -308,6 +333,7 @@ func (c *twoPhaseCommitter) doActionOnBatches(bo *Backoffer, action twoPhaseComm
 	return errors.Trace(err)
 }
 
+// 获得key和value全体的size
 func (c *twoPhaseCommitter) keyValueSize(key []byte) int {
 	size := len(key)
 	if mutation := c.mutations[string(key)]; mutation != nil {
@@ -316,10 +342,12 @@ func (c *twoPhaseCommitter) keyValueSize(key []byte) int {
 	return size
 }
 
+// 获得key的size
 func (c *twoPhaseCommitter) keySize(key []byte) int {
 	return len(key)
 }
 
+// 单个任务的请求函数，如果失败的原因是regionErr，那么就再次进行请求
 func (c *twoPhaseCommitter) prewriteSingleBatch(bo *Backoffer, batch batchKeys) error {
 	mutations := make([]*pb.Mutation, len(batch.keys))
 	for i, k := range batch.keys {
@@ -339,11 +367,13 @@ func (c *twoPhaseCommitter) prewriteSingleBatch(bo *Backoffer, batch batchKeys) 
 			SyncLog:  c.syncLog,
 		},
 	}
+	// 最终的操作还是通过region request实现的
 	for {
 		resp, err := c.store.SendReq(bo, req, batch.region, readTimeoutShort)
 		if err != nil {
 			return errors.Trace(err)
 		}
+		// 如果返回的结果是region error
 		regionErr, err := resp.GetRegionError()
 		if err != nil {
 			return errors.Trace(err)
@@ -422,6 +452,7 @@ func (c *twoPhaseCommitter) getUndeterminedErr() error {
 	return c.mu.undeterminedErr
 }
 
+// 单个任务的请求函数，如果失败的原因是regionErr，那么就再次进行请求
 func (c *twoPhaseCommitter) commitSingleBatch(bo *Backoffer, batch batchKeys) error {
 	req := &tikvrpc.Request{
 		Type: tikvrpc.CmdCommit,
@@ -498,6 +529,7 @@ func (c *twoPhaseCommitter) commitSingleBatch(bo *Backoffer, batch batchKeys) er
 	return nil
 }
 
+// 单个任务的请求函数，如果失败的原因是regionErr，那么就再次进行请求
 func (c *twoPhaseCommitter) cleanupSingleBatch(bo *Backoffer, batch batchKeys) error {
 	req := &tikvrpc.Request{
 		Type: tikvrpc.CmdBatchRollback,
@@ -534,10 +566,12 @@ func (c *twoPhaseCommitter) cleanupSingleBatch(bo *Backoffer, batch batchKeys) e
 	return nil
 }
 
+// 根据不同的操作类型，选择不同的对keys的操作
 func (c *twoPhaseCommitter) prewriteKeys(bo *Backoffer, keys [][]byte) error {
 	return c.doActionOnKeys(bo, actionPrewrite, keys)
 }
 
+// 这个操作会把所有的key都作为一组操作
 func (c *twoPhaseCommitter) commitKeys(bo *Backoffer, keys [][]byte) error {
 	return c.doActionOnKeys(bo, actionCommit, keys)
 }
@@ -714,9 +748,12 @@ type batchKeys struct {
 
 // appendBatchBySize appends keys to []batchKeys. It may split the keys to make
 // sure each batch's size does not exceed the limit.
+// 分组操作的过程
 func appendBatchBySize(b []batchKeys, region RegionVerID, keys [][]byte, sizeFn func([]byte) int, limit int) []batchKeys {
 	var start, end int
+	// 只能把同一个region version的放入到bach中
 	for start = 0; start < len(keys); start = end {
+		// 每次
 		var size int
 		for end = start; end < len(keys) && size < limit; end++ {
 			size += sizeFn(keys[end])

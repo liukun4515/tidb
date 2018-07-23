@@ -210,10 +210,13 @@ func (c *RegionCache) GroupKeysByRegion(bo *Backoffer, keys [][]byte) (map[Regio
 				return nil, first, errors.Trace(err)
 			}
 		}
+		// 上边的工作是找到对应的key的region信息
 		id := lastLoc.Region
+		// 如果是第一个key，那么就选择为primary key
 		if i == 0 {
 			first = id
 		}
+		// 然后把对应的key append到对应的group region version下
 		groups[id] = append(groups[id], k)
 	}
 	return groups, first, nil

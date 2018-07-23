@@ -30,6 +30,7 @@ import (
 )
 
 const (
+	// 重试的策略方法过程
 	// NoJitter makes the backoff sequence strict exponential.
 	NoJitter = 1 + iota
 	// FullJitter applies random factors to strict exponential.
@@ -66,6 +67,10 @@ func NewBackoffFn(base, cap, jitter int) func(ctx context.Context) int {
 		}
 		log.Debugf("backoff base %d, sleep %d", base, sleep)
 		select {
+		// 返回的backoff的方法：
+		// 1. 等待sleep结束或者计时结束
+		// 2. 或者ctx结束
+		// 实际上如果这两个case都不返回的话，当前的go rountine会被block在这里
 		case <-time.After(time.Duration(sleep) * time.Millisecond):
 		case <-ctx.Done():
 		}
@@ -76,6 +81,7 @@ func NewBackoffFn(base, cap, jitter int) func(ctx context.Context) int {
 	}
 }
 
+// 指数计算，其实就是为了计算sleep的时间
 func expo(base, cap, n int) int {
 	return int(math.Min(float64(cap), float64(base)*math.Pow(2.0, float64(n))))
 }
@@ -83,17 +89,25 @@ func expo(base, cap, n int) int {
 type backoffType int
 
 // Back off types.
+// 重试的类型有多种
 const (
+	// tikv rpc
 	boTiKVRPC backoffType = iota
+	// lock
 	BoTxnLock
 	boTxnLockFast
+	// dp rpc
 	boPDRPC
+	// 找不到region
 	BoRegionMiss
+	// 更新leader
 	BoUpdateLeader
+	// server busy问题
 	boServerBusy
 )
 
 func (t backoffType) createFn(vars *kv.Variables) func(context.Context) int {
+	// 不太明白这里是干什么的
 	if vars.Hook != nil {
 		vars.Hook(t.String(), vars)
 	}
@@ -153,6 +167,8 @@ func (t backoffType) TError() *terror.Error {
 }
 
 // Maximum total sleep time(in ms) for kv/cop commands.
+// 因为backoff因为流量控制的原因需要sleep一定的时间
+// 这类是默认的最大的sleep的时间，对于一个请求request
 const (
 	copBuildTaskMaxBackoff         = 5000
 	tsoMaxBackoff                  = 5000
@@ -165,8 +181,9 @@ const (
 	GcOneRegionMaxBackoff          = 20000
 	GcResolveLockMaxBackoff        = 100000
 	deleteRangeOneRegionMaxBackoff = 100000
-	rawkvMaxBackoff                = 20000
-	splitRegionBackoff             = 20000
+	// raw kv的最大backoff
+	rawkvMaxBackoff    = 20000
+	splitRegionBackoff = 20000
 )
 
 // CommitMaxBackoff is max sleep time of the 'commit' command
@@ -176,6 +193,9 @@ var CommitMaxBackoff = 41000
 type Backoffer struct {
 	ctx context.Context
 
+	// 其实就是对应了back off function
+	// 主要是用来sleep的
+	//
 	fn         map[backoffType]func(context.Context) int
 	maxSleep   int
 	totalSleep int
@@ -185,6 +205,7 @@ type Backoffer struct {
 }
 
 // NewBackoffer creates a Backoffer with maximum sleep time(in ms).
+// 所以创建的时候只需要考虑最大的sleep时间
 func NewBackoffer(ctx context.Context, maxSleep int) *Backoffer {
 	return &Backoffer{
 		ctx:      ctx,
@@ -217,17 +238,21 @@ func (b *Backoffer) Backoff(typ backoffType, err error) error {
 		b.fn = make(map[backoffType]func(context.Context) int)
 	}
 	f, ok := b.fn[typ]
+	// 如果没有对应的function
 	if !ok {
+		// 就创建对应的function
+		// 每一个function都是直接对应一个sleep函数
 		f = typ.createFn(b.vars)
 		b.fn[typ] = f
 	}
-
+	// 执行函数进行sleep，会返回一个sleep的时间
 	b.totalSleep += f(b.ctx)
 	b.types = append(b.types, typ)
 
 	log.Debugf("%v, retry later(totalSleep %dms, maxSleep %dms)", err, b.totalSleep, b.maxSleep)
 
 	b.errors = append(b.errors, errors.Errorf("%s at %s", err.Error(), time.Now().Format(time.RFC3339Nano)))
+	// 如果max sleep不大于0，就表示可以无限bakc off
 	if b.maxSleep > 0 && b.totalSleep >= b.maxSleep {
 		errMsg := fmt.Sprintf("backoffer.maxSleep %dms is exceeded, errors:", b.maxSleep)
 		for i, err := range b.errors {
@@ -240,6 +265,7 @@ func (b *Backoffer) Backoff(typ backoffType, err error) error {
 		// Use the first backoff type to generate a MySQL error.
 		return b.types[0].TError()
 	}
+	// 如果没有超时或者其他错误就返回nil
 	return nil
 }
 
@@ -264,7 +290,9 @@ func (b *Backoffer) Clone() *Backoffer {
 
 // Fork creates a new Backoffer which keeps current Backoffer's sleep time and errors, and holds
 // a child context of current Backoffer's context.
+// fork出来的context，如果是自己cancel是不会影响parent的，但是如果parent cancel是会影响到 sub context的你内容的
 func (b *Backoffer) Fork() (*Backoffer, context.CancelFunc) {
+	// fork出来的是parent对应的ctx的子类信息
 	ctx, cancel := context.WithCancel(b.ctx)
 	return &Backoffer{
 		ctx:        ctx,

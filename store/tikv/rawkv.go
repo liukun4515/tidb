@@ -273,6 +273,9 @@ func (c *RawKVClient) sendReq(key []byte, req *tikvrpc.Request) (*tikvrpc.Respon
 			return nil, nil, errors.Trace(err)
 		}
 		if regionErr != nil {
+			// 这里其实就是失败了，然后rpc层次没有办法进行重试
+			// 并且这里返回的信息表示可以重试
+			// 那我们如何对这个过程进行retry
 			err := bo.Backoff(BoRegionMiss, errors.New(regionErr.String()))
 			if err != nil {
 				return nil, nil, errors.Trace(err)
@@ -294,11 +297,14 @@ func (c *RawKVClient) sendBatchReq(keys, values [][]byte) (*tikvrpc.Response, er
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
-
+	// 其实在这里需要把数据处理成 max size的batch操作
+	// 每一个batch操作的数据都必须在一个region上
+	// 然后接下来丢给rpc进行处理
 	sender := NewRegionRequestSender(c.regionCache, c.rpcClient)
 
 	for regionID, groupKeys := range groups {
 		for {
+			//
 			pairs := make([]*kvrpcpb.KvPair, 0, len(groupKeys))
 			for _, key := range groupKeys {
 				value := k2v[string(key)]
@@ -373,4 +379,9 @@ func (c *RawKVClient) sendDeleteRangeReq(startKey []byte, endKey []byte) (*tikvr
 		}
 		return resp, actualEndKey, nil
 	}
+}
+
+type Batch struct {
+	keys [][]byte
+	values [][]byte
 }
